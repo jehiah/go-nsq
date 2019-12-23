@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"time"
+	"log"
 )
 
 var byteSpace = []byte(" ")
@@ -89,6 +90,7 @@ func (c *Command) WriteTo(w io.Writer) (int64, error) {
 // See http://nsq.io/clients/tcp_protocol_spec.html#identify for information
 // on the supported options
 func Identify(js map[string]interface{}) (*Command, error) {
+	log.Printf("%#v", js)
 	body, err := json.Marshal(js)
 	if err != nil {
 		return nil, err
