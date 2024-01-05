@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -127,6 +128,7 @@ type Consumer struct {
 	lookupdRecheckChan chan int
 	lookupdHTTPAddrs   []string
 	lookupdQueryIndex  int
+	lookupdHttpClient  *http.Client
 
 	wg              sync.WaitGroup
 	runningHandlers int32
@@ -218,7 +220,7 @@ func (r *Consumer) conns() []*Conn {
 // The logger parameter is an interface that requires the following
 // method to be implemented (such as the the stdlib log.Logger):
 //
-//    Output(calldepth int, s string)
+//    Output(calldepth int, s string) error
 //
 func (r *Consumer) SetLogger(l logger, lvl LogLevel) {
 	r.logGuard.Lock()
@@ -325,6 +327,11 @@ func (r *Consumer) ChangeMaxInFlight(maxInFlight int) {
 	}
 }
 
+// set lookupd http client
+func (r *Consumer) SetLookupdHttpClient(httpclient *http.Client) {
+	r.lookupdHttpClient = httpclient
+}
+
 // ConnectToNSQLookupd adds an nsqlookupd address to the list for this Consumer instance.
 //
 // If it is the first to be added, it initiates an HTTP request to discover nsqd
@@ -339,7 +346,8 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 		return errors.New("no handlers")
 	}
 
-	if err := validatedLookupAddr(addr); err != nil {
+	parsedAddr, err := buildLookupAddr(addr, r.topic)
+	if err != nil {
 		return err
 	}
 
@@ -347,12 +355,29 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 
 	r.mtx.Lock()
 	for _, x := range r.lookupdHTTPAddrs {
-		if x == addr {
+		if x == parsedAddr {
 			r.mtx.Unlock()
 			return nil
 		}
 	}
-	r.lookupdHTTPAddrs = append(r.lookupdHTTPAddrs, addr)
+	r.lookupdHTTPAddrs = append(r.lookupdHTTPAddrs, parsedAddr)
+	if r.lookupdHttpClient == nil {
+		transport := &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   r.config.LookupdPollTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ResponseHeaderTimeout: r.config.LookupdPollTimeout,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+		}
+		r.lookupdHttpClient = &http.Client{
+			Transport: transport,
+			Timeout:   r.config.LookupdPollTimeout,
+		}
+	}
+
 	numLookupd := len(r.lookupdHTTPAddrs)
 	r.mtx.Unlock()
 
@@ -378,20 +403,6 @@ func (r *Consumer) ConnectToNSQLookupds(addresses []string) error {
 		if err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func validatedLookupAddr(addr string) error {
-	if strings.Contains(addr, "/") {
-		_, err := url.Parse(addr)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-	if !strings.Contains(addr, ":") {
-		return errors.New("missing port")
 	}
 	return nil
 }
@@ -445,23 +456,7 @@ func (r *Consumer) nextLookupdEndpoint() string {
 	r.mtx.RUnlock()
 	r.lookupdQueryIndex = (r.lookupdQueryIndex + 1) % num
 
-	urlString := addr
-	if !strings.Contains(urlString, "://") {
-		urlString = "http://" + addr
-	}
-
-	u, err := url.Parse(urlString)
-	if err != nil {
-		panic(err)
-	}
-	if u.Path == "/" || u.Path == "" {
-		u.Path = "/lookup"
-	}
-
-	v, err := url.ParseQuery(u.RawQuery)
-	v.Add("topic", r.topic)
-	u.RawQuery = v.Encode()
-	return u.String()
+	return addr
 }
 
 type lookupResp struct {
@@ -492,7 +487,11 @@ retry:
 	r.log(LogLevelInfo, "querying nsqlookupd %s", endpoint)
 
 	var data lookupResp
-	err := apiRequestNegotiateV1("GET", endpoint, nil, &data)
+	headers := make(http.Header)
+	if r.config.AuthSecret != "" && r.config.LookupdAuthorization {
+		headers.Set("Authorization", fmt.Sprintf("Bearer %s", r.config.AuthSecret))
+	}
+	err := apiRequestNegotiateV1(r.lookupdHttpClient, "GET", endpoint, headers, &data)
 	if err != nil {
 		r.log(LogLevelError, "error querying nsqlookupd (%s) - %s", endpoint, err)
 		retries++
@@ -610,8 +609,11 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 
 	// pre-emptive signal to existing connections to lower their RDY count
 	for _, c := range r.conns() {
-		r.maybeUpdateRDY(c)
+		if c != conn {
+			r.maybeUpdateRDY(c)
+		}
 	}
+	r.maybeUpdateRDY(conn)
 
 	return nil
 }
@@ -654,10 +656,15 @@ func (r *Consumer) DisconnectFromNSQD(addr string) error {
 // DisconnectFromNSQLookupd removes the specified `nsqlookupd` address
 // from the list used for periodic discovery.
 func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
+	parsedAddr, err := buildLookupAddr(addr, r.topic)
+	if err != nil {
+		return err
+	}
+
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
 
-	idx := indexOf(addr, r.lookupdHTTPAddrs)
+	idx := indexOf(parsedAddr, r.lookupdHTTPAddrs)
 	if idx == -1 {
 		return ErrNotConnected
 	}
@@ -908,7 +915,9 @@ func (r *Consumer) maybeUpdateRDY(conn *Conn) {
 
 	count := r.perConnMaxInFlight()
 	r.log(LogLevelDebug, "(%s) sending RDY %d", conn, count)
-	r.updateRDY(conn, count)
+	if err := r.updateRDY(conn, count); err != nil {
+		r.log(LogLevelWarning, "(%s) error sending RDY %d: %v", conn, count, err)
+	}
 }
 
 func (r *Consumer) rdyLoop() {
@@ -1024,8 +1033,8 @@ func (r *Consumer) redistributeRDY() {
 
 	possibleConns := make([]*Conn, 0, len(conns))
 	for _, c := range conns {
-		lastMsgDuration := time.Now().Sub(c.LastMessageTime())
-		lastRdyDuration := time.Now().Sub(c.LastRdyTime())
+		lastMsgDuration := time.Since(c.LastMessageTime())
+		lastRdyDuration := time.Since(c.LastRdyTime())
 		rdyCount := c.RDY()
 		r.log(LogLevelDebug, "(%s) rdy: %d (last message received %s)",
 			c.String(), rdyCount, lastMsgDuration)
@@ -1198,4 +1207,29 @@ func (r *Consumer) log(lvl LogLevel, line string, args ...interface{}) {
 	logger.Output(2, fmt.Sprintf("%-4s %3d [%s/%s] %s",
 		lvl, r.id, r.topic, r.channel,
 		fmt.Sprintf(line, args...)))
+}
+
+func buildLookupAddr(addr, topic string) (string, error) {
+	urlString := addr
+	if !strings.Contains(urlString, "://") {
+		urlString = "http://" + addr
+	}
+
+	u, err := url.Parse(urlString)
+	if err != nil {
+		return "", err
+	}
+
+	if u.Port() == "" {
+		return "", errors.New("missing port")
+	}
+
+	if u.Path == "/" || u.Path == "" {
+		u.Path = "/lookup"
+	}
+
+	v, err := url.ParseQuery(u.RawQuery)
+	v.Add("topic", topic)
+	u.RawQuery = v.Encode()
+	return u.String(), nil
 }

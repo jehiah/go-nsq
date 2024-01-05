@@ -357,7 +357,7 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 		return nil, ErrIdentify{err.Error()}
 	}
 
-	frameType, data, err := ReadUnpackedResponse(c)
+	frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
 	if err != nil {
 		return nil, ErrIdentify{err.Error()}
 	}
@@ -436,7 +436,7 @@ func (c *Conn) upgradeTLS(tlsConf *tls.Config) error {
 	}
 	c.r = c.tlsConn
 	c.w = c.tlsConn
-	frameType, data, err := ReadUnpackedResponse(c)
+	frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
 	if err != nil {
 		return err
 	}
@@ -454,7 +454,7 @@ func (c *Conn) upgradeDeflate(level int) error {
 	fw, _ := flate.NewWriter(conn, level)
 	c.r = flate.NewReader(conn)
 	c.w = fw
-	frameType, data, err := ReadUnpackedResponse(c)
+	frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
 	if err != nil {
 		return err
 	}
@@ -471,7 +471,7 @@ func (c *Conn) upgradeSnappy() error {
 	}
 	c.r = snappy.NewReader(conn)
 	c.w = snappy.NewWriter(conn)
-	frameType, data, err := ReadUnpackedResponse(c)
+	frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
 	if err != nil {
 		return err
 	}
@@ -492,7 +492,7 @@ func (c *Conn) auth(secret string) error {
 		return err
 	}
 
-	frameType, data, err := ReadUnpackedResponse(c)
+	frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
 	if err != nil {
 		return err
 	}
@@ -520,7 +520,7 @@ func (c *Conn) readLoop() {
 			goto exit
 		}
 
-		frameType, data, err := ReadUnpackedResponse(c)
+		frameType, data, err := ReadUnpackedResponse(c, c.config.MaxMsgSize)
 		if err != nil {
 			if err == io.EOF && atomic.LoadInt32(&c.closeFlag) == 1 {
 				goto exit
@@ -694,7 +694,7 @@ func (c *Conn) cleanup() {
 			msgsInFlight = atomic.LoadInt64(&c.messagesInFlight)
 		}
 		if msgsInFlight > 0 {
-			if time.Now().Sub(lastWarning) > time.Second {
+			if time.Since(lastWarning) > time.Second {
 				c.log(LogLevelWarning, "draining... waiting for %d messages in flight", msgsInFlight)
 				lastWarning = time.Now()
 			}
@@ -703,7 +703,7 @@ func (c *Conn) cleanup() {
 		// until the readLoop has exited we cannot be sure that there
 		// still won't be a race
 		if atomic.LoadInt32(&c.readLoopRunning) == 1 {
-			if time.Now().Sub(lastWarning) > time.Second {
+			if time.Since(lastWarning) > time.Second {
 				c.log(LogLevelWarning, "draining... readLoop still running")
 				lastWarning = time.Now()
 			}
